@@ -56,6 +56,9 @@ class SplineVST(nn.Module):
         superlinear_ratio_threshold: float = 10.0,
         superlinear_proxy_mode: str = 'log1p_clip',
         bin_centers_from_proxy: bool = False,
+        self_consistent_iters: int = 1,
+        self_consistent_base: str = 'identity',
+        self_consistent_detach: bool = True,
     ):
         super().__init__()
         self.k = k
@@ -72,6 +75,9 @@ class SplineVST(nn.Module):
         self.superlinear_ratio_threshold = superlinear_ratio_threshold
         self.superlinear_proxy_mode = superlinear_proxy_mode
         self.bin_centers_from_proxy = bin_centers_from_proxy
+        self.self_consistent_iters = self_consistent_iters
+        self.self_consistent_base = self_consistent_base
+        self.self_consistent_detach = self_consistent_detach
 
         log_internal = self._log_spaced_knots(grid_range, num_knots + 1)
         internal = torch.einsum(
@@ -226,6 +232,14 @@ class SplineVST(nn.Module):
         out = torch.where(mode == self._PROXY_ASINH, asinh, out)
         return out
 
+    def _baseline_proxy(self, x):
+        if self.self_consistent_base == 'identity':
+            return x
+        if self.self_consistent_base == 'log1p':
+            return torch.log1p(x.clamp_min(0.0))
+        raise ValueError(f'Unknown self-consistent base: {self.self_consistent_base}')
+
+
     def _init_normalization_from_data(self, x_input):
         with torch.no_grad():
             device = x_input.device
@@ -294,20 +308,30 @@ class SplineVST(nn.Module):
         if self.initialized.item() == 0:
             self.init_bins_from_data(x_raw)
 
-        x_proxy = self._apply_proxy(x_raw.detach())
-        z_proxy = self._rank_gauss(x_proxy)
-
         _, d = y.shape
-        sigma = (self.bin_sigma * sigma_scale).view(1, d, 1) + 1e-8
-        dists = (z_proxy.unsqueeze(-1) - self.bin_centers.unsqueeze(0)) / sigma
-        w = torch.exp(-0.5 * dists**2) + 1e-12
-        w = w / w.sum(dim=-1, keepdim=True)
-        w_sum = w.sum(dim=0)
-        valid_mask = w_sum > self.min_density
-
         y_expanded = y.unsqueeze(-1)
-        mean_k = (w * y_expanded).sum(dim=0) / (w_sum + 1e-12)
-        var_k = (w * (y_expanded - mean_k.unsqueeze(0)) ** 2).sum(dim=0) / (w_sum + 1e-12)
+
+        def _stats_from_proxy(z_proxy: torch.Tensor):
+            sigma = (self.bin_sigma * sigma_scale).view(1, d, 1) + 1e-8
+            dists = (z_proxy.unsqueeze(-1) - self.bin_centers.unsqueeze(0)) / sigma
+            w = torch.exp(-0.5 * dists**2) + 1e-12
+            w = w / w.sum(dim=-1, keepdim=True)
+            w_sum = w.sum(dim=0)
+            valid_mask = w_sum > self.min_density
+            mean_k = (w * y_expanded).sum(dim=0) / (w_sum + 1e-12)
+            var_k = (w * (y_expanded - mean_k.unsqueeze(0)) ** 2).sum(dim=0) / (w_sum + 1e-12)
+            return w, w_sum, valid_mask, mean_k, var_k
+
+        baseline_proxy = self._baseline_proxy(x_raw.detach())
+        proxy = baseline_proxy
+        for _ in range(self.self_consistent_iters):
+            z_proxy = self._rank_gauss(proxy)
+            w, w_sum, valid_mask, mean_k, _ = _stats_from_proxy(z_proxy)
+            mu_hat = (w * mean_k.unsqueeze(0)).sum(dim=-1)
+            proxy = mu_hat.detach() if self.self_consistent_detach else mu_hat
+        proxy = proxy.detach() if self.self_consistent_detach else proxy
+        z_proxy = self._rank_gauss(proxy)
+        w, w_sum, valid_mask, mean_k, var_k = _stats_from_proxy(z_proxy)
 
         if self.training:
             with torch.no_grad():
@@ -332,43 +356,6 @@ class SplineVST(nn.Module):
         var_d_valid = var_d[valid_features]
         return (weights * var_d_valid).sum() / weights.sum()
 
-    def compute_vst_loss_oracle(
-        self,
-        y: torch.Tensor,
-        mu_raw: torch.Tensor,
-        mu_bin_centers: torch.Tensor,
-        mu_bin_sigma: torch.Tensor,
-        sigma_scale: float = 1.0,
-    ) -> torch.Tensor:
-        device = self.grid.device
-        y = y.to(device)
-        mu_raw = mu_raw.to(device)
-        log_mu = torch.log(mu_raw.clamp_min(1e-8)).detach()
-        _, d = y.shape
-        sigma = (mu_bin_sigma * sigma_scale).view(1, d, 1) + 1e-8
-        dists = (log_mu.unsqueeze(-1) - mu_bin_centers.unsqueeze(0)) / sigma
-        w = torch.exp(-0.5 * dists**2) + 1e-12
-        w = w / w.sum(dim=-1, keepdim=True)
-        w_sum = w.sum(dim=0)
-        valid_mask = w_sum > self.min_density
-        y_expanded = y.unsqueeze(-1)
-        mean_k = (w * y_expanded).sum(dim=0) / (w_sum + 1e-12)
-        var_k = (w * (y_expanded - mean_k.unsqueeze(0)) ** 2).sum(dim=0) / (w_sum + 1e-12)
-        var_k = torch.clamp(var_k, min=1e-8)
-        log_v = torch.log(var_k)
-        log_v_masked = log_v.clone()
-        log_v_masked[~valid_mask] = float('nan')
-        n_valid = valid_mask.sum(dim=1)
-        mu_d = torch.nansum(log_v_masked, dim=1) / (n_valid + 1e-8)
-        diff_sq = (log_v_masked - mu_d.unsqueeze(-1)).square()
-        var_d = torch.nansum(diff_sq, dim=1) / (n_valid - 1 + 1e-8)
-        valid_features = n_valid >= 2
-        if not valid_features.any():
-            return torch.tensor(0.0, device=device)
-        weights = (n_valid - 1).clamp_min(1.0).float()
-        weights = weights[valid_features]
-        var_d_valid = var_d[valid_features]
-        return (weights * var_d_valid).sum() / weights.sum()
 
     def smoothness_loss(self):
         c = self.coefficients().squeeze(1)
@@ -400,6 +387,17 @@ class SplineVST(nn.Module):
           self.register_buffer('_y_hi', y_hi)
           self.register_buffer('_slope_lo', (y_lo_eps - y_lo) / eps)
           self.register_buffer('_slope_hi', (y_hi - y_hi_eps) / eps)
+
+    @staticmethod
+    def rescale_to_target_variance(values: torch.Tensor, target_variance: float = 1.0):
+        target_variance = max(target_variance, 1e-8)
+        var = values.var(dim=0, unbiased=False).clamp_min(1e-8)
+        scale = torch.sqrt(target_variance / var)
+        return values * scale, scale
+
+    def conditional_variance_score(self):
+        log_v = torch.log(self.running_var.clamp_min(1e-8))
+        return torch.nanmean(log_v, dim=1)
 
 
 def negative_binomial_vst(y: np.ndarray, dispersion: float) -> np.ndarray:
@@ -635,52 +633,6 @@ def build_convexvst_inputs(
     return hist, mu_centers, bin_centers
 
 
-def _rank_gauss_np(x: np.ndarray) -> np.ndarray:
-    x = np.nan_to_num(x.astype(np.float64))
-    n = x.shape[0]
-    if n == 0:
-        return x
-    order = np.argsort(x)
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(n, dtype=np.float64)
-    u = (ranks + 0.5) / n
-    u = np.clip(u, 1e-6, 1 - 1e-6)
-    return stats.norm.ppf(u)
-
-
-def build_convexvst_inputs_proxy(
-    y: np.ndarray,
-    num_proxy_bins: int = 20,
-    num_y_bins: int = 60,
-    y_extend_frac: float = 0.1,
-):
-    proxy = _rank_gauss_np(np.log1p(np.clip(y, 0, None)))
-    proxy_edges = np.quantile(proxy, np.linspace(0.0, 1.0, num_proxy_bins + 1))
-    y_min, y_max = np.min(y), np.max(y)
-    y_range = y_max - y_min
-    y_lo = y_min - y_extend_frac * y_range
-    y_hi = y_max + y_extend_frac * y_range
-    y_edges = np.linspace(y_lo, y_hi, num_y_bins + 1)
-    bin_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
-    hist = np.zeros((num_proxy_bins, num_y_bins), dtype=np.float64)
-    hist_centers = np.zeros(num_proxy_bins, dtype=np.float64)  # In y-space!
-    valid_bins = []
-    for i in range(num_proxy_bins):
-        lo, hi = proxy_edges[i], proxy_edges[i + 1]
-        mask = (proxy >= lo) & (proxy < hi if i < num_proxy_bins - 1 else proxy <= hi)
-        if mask.sum() == 0:
-            continue
-
-        hist_centers[i] = np.median(y[mask])  # Map back to y-space
-        valid_bins.append(i)
-        counts, _ = np.histogram(y[mask], bins=y_edges)
-        hist[i] = counts.astype(np.float64)
-    valid_bins = np.array(valid_bins)
-    hist = hist[valid_bins]
-    hist_centers = hist_centers[valid_bins]
-    return hist, hist_centers, bin_centers
-
-
 def build_convexvst_inputs_proxy_raw(
     y: np.ndarray,
     num_proxy_bins: int = 20,
@@ -716,7 +668,7 @@ def build_convexvst_inputs_proxy_raw(
 def train_spline_vst(y: torch.Tensor):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     y = y.to(device)
-    model = SplineVST(input_dim=1, num_knots=28, grid_range=(-4.0, 4.0)).to(device)
+    model = SplineVST(input_dim=1, num_knots=40, bandwidth_scale=1.0, grid_range=(-8.0, 8.0), self_consistent_base='identity', self_consistent_iters=3).to(device)
     model.initialize(y)
     optim = torch.optim.Adam(model.parameters(), lr=5e-3)
     batch_size = 512
@@ -799,8 +751,6 @@ def plot_transforms_matched_scale(
     x_plot,
     dispersion,
     device,
-    convex_fn_proxy=None,
-    bin_centers_proxy=None,
     convex_fn_raw=None,
     bin_centers_raw=None,
     save_path='transforms_matched_scale.png'
@@ -826,28 +776,19 @@ def plot_transforms_matched_scale(
     spline_rescaled = rescale_to_nb(spline_curve)
 
     # ConvexVST curves
-    convex_proxy_rescaled = None
     convex_raw_rescaled = None
-
-    if convex_fn_proxy is not None and bin_centers_proxy is not None:
-        convex_proxy_curve = apply_convexvst(x_plot, convex_fn_proxy, bin_centers_proxy)
-        convex_proxy_rescaled = rescale_to_nb(convex_proxy_curve)
 
     if convex_fn_raw is not None and bin_centers_raw is not None:
         convex_raw_curve = apply_convexvst(x_plot, convex_fn_raw, bin_centers_raw)
         convex_raw_rescaled = rescale_to_nb(convex_raw_curve)
 
-    # Plot
     plt.figure(figsize=(8, 5))
     plt.plot(x_plot, rescale_to_nb(x_plot), label='Identity', linestyle=':', alpha=0.5, color='gray')
     plt.plot(x_plot, nb_curve, label='NB VST', linewidth=2)
     plt.plot(x_plot, spline_rescaled, label='SplineVST', linewidth=2, linestyle='--')
 
-    if convex_proxy_rescaled is not None:
-        plt.plot(x_plot, convex_proxy_rescaled, label='ConvexVST (log+rank)', linewidth=1.5, linestyle='-.')
-
     if convex_raw_rescaled is not None:
-        plt.plot(x_plot, convex_raw_rescaled, label='ConvexVST (raw)', linewidth=1.5, linestyle=':')
+        plt.plot(x_plot, convex_raw_rescaled, label='ConvexVST', linewidth=1.5, linestyle=':')
 
     plt.xlabel('Observed value y')
     plt.ylabel('T(y)')
@@ -861,7 +802,6 @@ def plot_transforms_matched_scale(
     return {
         'nb_vst': nb_curve,
         'spline': spline_rescaled,
-        'convex_proxy': convex_proxy_rescaled,
         'convex_raw': convex_raw_rescaled,
     }
 
@@ -871,14 +811,10 @@ def plot_derivatives_matched_scale(
     x_plot,
     dispersion,
     device,
-    convex_fn_proxy=None,
-    bin_centers_proxy=None,
     convex_fn_raw=None,
     bin_centers_raw=None,
     save_path='derivatives_matched_scale.png'
 ):
-    """Plot transform derivatives with all methods rescaled to match NB VST's output range."""
-
     def numeric_derivative(curve, x):
         return np.gradient(curve, x)
 
@@ -889,11 +825,9 @@ def plot_derivatives_matched_scale(
         normalized = (curve - c_min) / (c_max - c_min + 1e-8)
         return normalized * (r_max - r_min) + r_min
 
-    # Compute negative binomial VST curve and its derivative
     nb_curve = negative_binomial_vst(x_plot, dispersion)
     nb_deriv = numeric_derivative(nb_curve, x_plot)
 
-    # Classical VST derivative: 1/sqrt(y + y^2 / r) for negative binomial
     eps = 1e-6
     r = max(dispersion, 1e-6)
     classical_deriv = 1.0 / np.sqrt(np.clip(x_plot, a_min=eps, a_max=None) + (x_plot**2) / r)
@@ -909,14 +843,7 @@ def plot_derivatives_matched_scale(
     spline_rescaled = rescale_to_match(spline_curve, nb_curve)
     spline_deriv = numeric_derivative(spline_rescaled, x_plot)
 
-    # ConvexVST curves
-    convex_proxy_deriv = None
     convex_raw_deriv = None
-
-    if convex_fn_proxy is not None and bin_centers_proxy is not None:
-        convex_proxy_curve = apply_convexvst(x_plot, convex_fn_proxy, bin_centers_proxy)
-        convex_proxy_rescaled = rescale_to_match(convex_proxy_curve, nb_curve)
-        convex_proxy_deriv = numeric_derivative(convex_proxy_rescaled, x_plot)
 
     if convex_fn_raw is not None and bin_centers_raw is not None:
         convex_raw_curve = apply_convexvst(x_plot, convex_fn_raw, bin_centers_raw)
@@ -928,7 +855,7 @@ def plot_derivatives_matched_scale(
     plt.plot(
         x_plot,
         classical_deriv,
-        label='Classical 1/√(y + y² / r)',
+        label='Classical 1/√(y + y^2 / r)',
         linestyle='--',
         color='black',
         linewidth=2,
@@ -936,11 +863,8 @@ def plot_derivatives_matched_scale(
     plt.plot(x_plot, nb_deriv, label="NB VST T'(y)", linewidth=2)
     plt.plot(x_plot, spline_deriv, label="SplineVST T'(y)", linewidth=2)
 
-    if convex_proxy_deriv is not None:
-        plt.plot(x_plot, convex_proxy_deriv, label="ConvexVST T'(y) (log+rank)", linewidth=1.5, linestyle='-.')
-
     if convex_raw_deriv is not None:
-        plt.plot(x_plot, convex_raw_deriv, label="ConvexVST T'(y) (raw)", linewidth=1.5, linestyle=':')
+        plt.plot(x_plot, convex_raw_deriv, label="ConvexVST T'(y)", linewidth=1.5, linestyle=':')
 
     plt.xscale('log')
     plt.yscale('log')
@@ -957,7 +881,6 @@ def plot_derivatives_matched_scale(
         'classical': classical_deriv,
         'nb_vst': nb_deriv,
         'spline': spline_deriv,
-        'convex_proxy': convex_proxy_deriv,
         'convex_raw': convex_raw_deriv,
     }
 
@@ -967,15 +890,10 @@ def plot_residuals_diagnostic(
     mu_test: np.ndarray,
     spline_vals_test: np.ndarray,
     nb_vst_test: np.ndarray,
-    convex_proxy_test: np.ndarray,
     convex_raw_test: np.ndarray,
     save_path: str = 'residuals_diagnostic.png',
     method: str = 'lowess'  # 'lowess', 'linear', or 'polynomial'
 ):
-    """
-    Plot residuals vs μ for each transform to visually assess homoscedasticity.
-    For a good VST, the residual spread should be constant across μ.
-    """
     from statsmodels.nonparametric.smoothers_lowess import lowess as lowess_fn
 
     sort_idx = np.argsort(mu_test)
@@ -986,18 +904,16 @@ def plot_residuals_diagnostic(
         'Identity': y_test[sort_idx],
         'NB VST': nb_vst_test[sort_idx],
         'SplineVST': spline_vals_test[sort_idx],
-        'ConvexVST (log+rank)': convex_proxy_test[sort_idx],
-        'ConvexVST (raw)': convex_raw_test[sort_idx],
+        'ConvexVST': convex_raw_test[sort_idx],
     }
 
-    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
     axes = axes.flatten()
 
     for idx, (name, transformed) in enumerate(transforms.items()):
         ax = axes[idx]
         transformed = transformed.astype(float)
 
-        # Compute fitted values using chosen method
         if method == 'lowess':
             fitted = lowess_fn(transformed, log_mu, frac=0.15, return_sorted=False)
         elif method == 'linear':
@@ -1011,19 +927,11 @@ def plot_residuals_diagnostic(
 
         residuals = transformed - fitted
 
-        # Subsample for plotting
         n_plot = min(2000, len(mu_sorted))
         plot_idx = np.linspace(0, len(mu_sorted) - 1, n_plot).astype(int)
 
         ax.scatter(mu_sorted[plot_idx], residuals[plot_idx], alpha=0.3, s=5)
         ax.axhline(y=0, color='red', linestyle='--', linewidth=1)
-
-        # Compute local standard deviation using LOWESS on squared residuals
-        #local_var = lowess_fn(residuals**2, log_mu, frac=0.15, return_sorted=False)
-        #local_std = np.sqrt(np.maximum(local_var, 0))
-
-        #ax.plot(mu_sorted, 2 * local_std, color='orange', linewidth=1.5, label='±2σ (local)')
-        #ax.plot(mu_sorted, -2 * local_std, color='orange', linewidth=1.5)
 
         ax.set_xscale('log')
         ax.set_xlabel('μ (Negative binomial mean)')
@@ -1031,9 +939,9 @@ def plot_residuals_diagnostic(
         ax.set_title(name)
         ax.legend(loc='upper right')
 
-    axes[5].axis('off')
+    axes[4].axis('off')
 
-    plt.suptitle(f'Residuals vs. μ ({method} regression): Constant spread indicates successful VST', y=1.02)
+    plt.suptitle(f'Residuals vs. μ', y=1.02)
     plt.tight_layout()
     plt.savefig(save_path, dpi=200, bbox_inches='tight')
     plt.close()
@@ -1049,11 +957,6 @@ def main():
     identity_test = y_test.copy()
     nb_vst_test = negative_binomial_vst(y_test, dispersion=dispersion)
 
-    hist_proxy, proxy_centers, bin_centers_proxy = build_convexvst_inputs_proxy(
-        y_train, num_proxy_bins=25, num_y_bins=80
-    )
-    _, convex_fn_proxy = convex_vst(hist_proxy, proxy_centers, bin_centers_proxy)
-
     hist_raw, raw_proxy_centers, bin_centers_raw = build_convexvst_inputs_proxy_raw(
         y_train, num_proxy_bins=25, num_y_bins=80
     )
@@ -1065,16 +968,12 @@ def main():
     with torch.no_grad():
         spline_vals_test = spline_model(torch.tensor(y_test, device=device).unsqueeze(1)).cpu().squeeze(1).numpy()
 
-    convex_proxy_test = apply_convexvst(y_test, convex_fn_proxy, bin_centers_proxy)
     convex_raw_test = apply_convexvst(y_test, convex_fn_raw, bin_centers_raw)
 
     rng = np.random.default_rng(123)
     identity_metrics = evaluate_with_bootstrap(identity_test, mu_test, num_bins=20, num_resamples=200, rng=rng)
     nb_metrics = evaluate_with_bootstrap(nb_vst_test, mu_test, num_bins=20, num_resamples=200, rng=rng)
     spline_metrics = evaluate_with_bootstrap(spline_vals_test, mu_test, num_bins=20, num_resamples=200, rng=rng)
-    convex_proxy_metrics = evaluate_with_bootstrap(
-        convex_proxy_test, mu_test, num_bins=20, num_resamples=200, rng=rng
-    )
     convex_raw_metrics = evaluate_with_bootstrap(
         convex_raw_test, mu_test, num_bins=20, num_resamples=200, rng=rng
     )
@@ -1082,7 +981,6 @@ def main():
     identity_strata = stratify_metrics(identity_test, mu_test)
     nb_strata = stratify_metrics(nb_vst_test, mu_test)
     spline_strata = stratify_metrics(spline_vals_test, mu_test)
-    convex_proxy_strata = stratify_metrics(convex_proxy_test, mu_test)
     convex_raw_strata = stratify_metrics(convex_raw_test, mu_test)
 
     def print_metrics(label, metrics):
@@ -1096,8 +994,7 @@ def main():
     print_metrics('Identity', identity_metrics)
     print_metrics('NB VST', nb_metrics)
     print_metrics('SplineVST', spline_metrics)
-    print_metrics('ConvexVST (log+rank proxy)', convex_proxy_metrics)
-    print_metrics('ConvexVST (raw proxy)', convex_raw_metrics)
+    print_metrics('ConvexVST', convex_raw_metrics)
 
     def print_strata(label, strata):
         print(f"\n{label} stratified metrics:")
@@ -1120,19 +1017,12 @@ def main():
     print_strata('Identity', identity_strata)
     print_strata('NB VST', nb_strata)
     print_strata('SplineVST', spline_strata)
-    print_strata('ConvexVST (rank proxy)', convex_proxy_strata)
-    print_strata('ConvexVST (raw proxy)', convex_raw_strata)
+    print_strata('ConvexVST', convex_raw_strata)
 
     plt.figure(figsize=(7, 5))
     plt.plot(identity_metrics['bin_centers'], identity_metrics['bin_vars'], label='Identity variance', marker='o')
     plt.plot(nb_metrics['bin_centers'], nb_metrics['bin_vars'], label='NB VST variance', marker='o')
     plt.plot(spline_metrics['bin_centers'], spline_metrics['bin_vars'], label='SplineVST variance', marker='o')
-    plt.plot(
-        convex_proxy_metrics['bin_centers'],
-        convex_proxy_metrics['bin_vars'],
-        label='ConvexVST variance (log+rank proxy)',
-        marker='o',
-    )
     plt.plot(
         convex_raw_metrics['bin_centers'],
         convex_raw_metrics['bin_vars'],
@@ -1146,10 +1036,9 @@ def main():
     plt.title('Variance stabilization on negative binomial data (test set)')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('splinevst_vs_gat.png', dpi=200)
-    print('\nSaved variance plot to splinevst_vs_gat.png')
+    plt.savefig('variance_stabilization_nb.png', dpi=200)
+    print('\nSaved variance plot to variance_stabilization_nb.png')
 
-    # Plot the learned / defined transforms on a common input grid
     all_y = np.concatenate([y_train, y_test])
     x_plot = np.linspace(all_y.min(), all_y.max(), 400)
 
@@ -1163,19 +1052,16 @@ def main():
 
     identity_curve = x_plot
     nb_curve = negative_binomial_vst(x_plot, dispersion=dispersion)
-    convex_proxy_curve = apply_convexvst(x_plot, convex_fn_proxy, bin_centers_proxy)
     convex_raw_curve = apply_convexvst(x_plot, convex_fn_raw, bin_centers_raw)
 
     def normalize(curve):
       return (curve - curve.min()) / (curve.max() - curve.min() + 1e-8)
 
-    # Plot normalized transforms
     plt.figure(figsize=(7, 5))
     plt.plot(x_plot, normalize(identity_curve), label='Identity')
     plt.plot(x_plot, normalize(nb_curve), label='NB VST')
     plt.plot(x_plot, normalize(spline_curve), label='SplineVST')
-    plt.plot(x_plot, normalize(convex_proxy_curve), label='ConvexVST (log+rank proxy)')
-    plt.plot(x_plot, normalize(convex_raw_curve), label='ConvexVST (raw proxy)')
+    plt.plot(x_plot, normalize(convex_raw_curve), label='ConvexVST')
     plt.xlabel('Observed value y')
     plt.ylabel('Normalized T(y)')
     plt.title('Learned / defined transforms (normalized)')
@@ -1183,81 +1069,25 @@ def main():
     plt.tight_layout()
     plt.savefig('splinevst_transforms_normalized.png', dpi=200)
 
-    # Check normalization parameters
     print("norm_shift:", spline_model.norm_shift.item())
     print("norm_scale:", spline_model.norm_scale.item())
 
-    # What input value hits the grid boundary?
-    grid_hi = spline_model.grid[0, -(spline_model.k + 1)].item()
-    clamp_threshold = spline_model.norm_shift.item() + grid_hi * spline_model.norm_scale.item()
-    print("Values above this get clamped:", clamp_threshold)
-    print("x_plot max:", x_plot.max())
-
-    # What fraction of test data is clamped?
-    frac_clamped = (y_test > clamp_threshold).mean()
-    print(f"Fraction of test data clamped: {frac_clamped:.2%}")
-
-    # Check data density across the range
-    plt.figure(figsize=(10, 4))
-
-    plt.subplot(1, 2, 1)
-    plt.hist(y_train, bins=50, density=True, alpha=0.7)
-    plt.axvline(x=80, color='r', linestyle='--', label='Peak region start')
-    plt.axvline(x=100, color='r', linestyle='--', label='Peak region end')
-    plt.axvline(x=clamp_threshold, color='g', linestyle='--', label='Clamp threshold')
-    plt.xlabel('y value')
-    plt.ylabel('Density')
-    plt.title('Training data distribution')
-    plt.legend()
-
     plt.subplot(1, 2, 2)
-    # Plot the spline's second derivative (curvature) to see where it's unstable
     coef = spline_model.coefficients().squeeze().detach().cpu().numpy()
     d2 = coef[:-2] - 2 * coef[1:-1] + coef[2:]
     plt.plot(np.abs(d2))
     plt.xlabel('Control point index')
     plt.ylabel('|Second difference|')
-    plt.title('Spline curvature (should be smooth)')
+    plt.title('Spline curvature')
 
     plt.tight_layout()
     plt.savefig('spline_diagnostics.png', dpi=150)
 
-    plt.figure(figsize=(10, 5))
-
-    plt.subplot(1, 2, 1)
-    plt.plot(x_plot, nb_curve, label='NB VST')
-    plt.plot(x_plot, spline_curve, label='SplineVST')
-    plt.xlabel('Observed value y')
-    plt.ylabel('T(y)')
-    plt.title('Raw transforms (unnormalized)')
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    # Zoom into the "peak" region
-    mask = (x_plot >= 60) & (x_plot <= 130)
-    plt.plot(x_plot[mask], nb_curve[mask], label='NB VST')
-    plt.plot(x_plot[mask], spline_curve[mask], label='SplineVST')
-    plt.xlabel('Observed value y')
-    plt.ylabel('T(y)')
-    plt.title('Zoomed: y ∈ [60, 130]')
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig('raw_transforms.png', dpi=150)
-
-    # Check where the max occurs
-    print(f"SplineVST max value: {spline_curve.max():.4f} at y = {x_plot[np.argmax(spline_curve)]:.2f}")
-    print(f"SplineVST value at y=127 (end): {spline_curve[-1]:.4f}")
-    print(f"Is the curve monotonic? {np.all(np.diff(spline_curve) >= -1e-6)}")
-
-    # After defining x_plot and training all models
     plot_transforms_matched_scale(
         spline_model=spline_model,
         x_plot=x_plot,
         dispersion=dispersion,
         device=device,
-        convex_fn_proxy=convex_fn_proxy,
-        bin_centers_proxy=bin_centers_proxy,
         convex_fn_raw=convex_fn_raw,
         bin_centers_raw=bin_centers_raw,
     )
@@ -1267,8 +1097,6 @@ def main():
         x_plot=x_plot,
         dispersion=dispersion,
         device=device,
-        convex_fn_proxy=convex_fn_proxy,
-        bin_centers_proxy=bin_centers_proxy,
         convex_fn_raw=convex_fn_raw,
         bin_centers_raw=bin_centers_raw,
     )
@@ -1278,7 +1106,6 @@ def main():
         mu_test=mu_test,
         spline_vals_test=spline_vals_test,
         nb_vst_test=nb_vst_test,
-        convex_proxy_test=convex_proxy_test,
         convex_raw_test=convex_raw_test,
         save_path='residuals_diagnostic.png',
         method='lowess'
