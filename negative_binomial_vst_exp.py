@@ -543,7 +543,8 @@ def convex_vst(
     bin_centers: np.ndarray,
     var_ratio: np.ndarray | None = None,
     solver: str | None = None,
-    maxiter: int = 500,
+    maxiter: int = 2000,
+    solver_opts: dict | None = None,
 ):
     hist = np.asarray(hist, dtype=np.float64)
     hist_centers = np.asarray(hist_centers, dtype=np.float64)
@@ -558,6 +559,7 @@ def convex_vst(
             f'hist_centers [{hist_centers.min():.2f}, {hist_centers.max():.2f}] '
             f'outside bin_centers [{bin_centers.min():.2f}, {bin_centers.max():.2f}]'
         )
+    hist = hist + 1e-12
     row_sums = hist.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1.0
     hist = hist / row_sums
@@ -587,9 +589,14 @@ def convex_vst(
         quad = cp.sum(cp.multiply(hist[i], cp.square(diff))) / var_ratio[i]
         constraints.append(quad <= t)
     problem = cp.Problem(cp.Minimize(t), constraints)
-    for s in ([solver] if solver else ['ECOS', 'CLARABEL', 'SCS']):
+    solver_opts = {} if solver_opts is None else dict(solver_opts)
+    for s in ([solver] if solver else ['CLARABEL', 'SCS', 'ECOS']):
         try:
-            problem.solve(solver=s, max_iters=maxiter)
+            solve_kwargs = dict(solver=s, max_iters=maxiter)
+            if s == 'SCS':
+                solve_kwargs.update({'eps': 1e-4})
+            solve_kwargs.update(solver_opts)
+            problem.solve(**solve_kwargs)
             if problem.status in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
                 break
         except Exception:
@@ -782,6 +789,7 @@ def plot_transforms_matched_scale(
         convex_raw_curve = apply_convexvst(x_plot, convex_fn_raw, bin_centers_raw)
         convex_raw_rescaled = rescale_to_nb(convex_raw_curve)
 
+    # Plot
     plt.figure(figsize=(8, 5))
     plt.plot(x_plot, rescale_to_nb(x_plot), label='Identity', linestyle=':', alpha=0.5, color='gray')
     plt.plot(x_plot, nb_curve, label='NB VST', linewidth=2)
@@ -843,6 +851,7 @@ def plot_derivatives_matched_scale(
     spline_rescaled = rescale_to_match(spline_curve, nb_curve)
     spline_deriv = numeric_derivative(spline_rescaled, x_plot)
 
+    # ConvexVST curves
     convex_raw_deriv = None
 
     if convex_fn_raw is not None and bin_centers_raw is not None:
@@ -914,6 +923,7 @@ def plot_residuals_diagnostic(
         ax = axes[idx]
         transformed = transformed.astype(float)
 
+        # Compute fitted values using chosen method
         if method == 'lowess':
             fitted = lowess_fn(transformed, log_mu, frac=0.15, return_sorted=False)
         elif method == 'linear':
@@ -939,8 +949,6 @@ def plot_residuals_diagnostic(
         ax.set_title(name)
         ax.legend(loc='upper right')
 
-    axes[4].axis('off')
-
     plt.suptitle(f'Residuals vs. μ', y=1.02)
     plt.tight_layout()
     plt.savefig(save_path, dpi=200, bbox_inches='tight')
@@ -958,7 +966,7 @@ def main():
     nb_vst_test = negative_binomial_vst(y_test, dispersion=dispersion)
 
     hist_raw, raw_proxy_centers, bin_centers_raw = build_convexvst_inputs_proxy_raw(
-        y_train, num_proxy_bins=25, num_y_bins=80
+        y_train, num_proxy_bins=15, num_y_bins=60
     )
     _, convex_fn_raw = convex_vst(hist_raw, raw_proxy_centers, bin_centers_raw)
 
@@ -1071,14 +1079,6 @@ def main():
 
     print("norm_shift:", spline_model.norm_shift.item())
     print("norm_scale:", spline_model.norm_scale.item())
-
-    plt.subplot(1, 2, 2)
-    coef = spline_model.coefficients().squeeze().detach().cpu().numpy()
-    d2 = coef[:-2] - 2 * coef[1:-1] + coef[2:]
-    plt.plot(np.abs(d2))
-    plt.xlabel('Control point index')
-    plt.ylabel('|Second difference|')
-    plt.title('Spline curvature')
 
     plt.tight_layout()
     plt.savefig('spline_diagnostics.png', dpi=150)
